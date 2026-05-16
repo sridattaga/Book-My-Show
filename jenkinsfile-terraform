@@ -1,0 +1,181 @@
+pipeline {
+    agent any
+
+    tools {
+        jdk 'jdk17'
+        nodejs 'node20'
+    }
+
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        DOCKER_IMAGE = 'sridatta5157/bookmyshowproj:latest'
+        AWS_REGION = 'ap-southeast-2'
+        EKS_CLUSTER = 'bms-eks'
+    }
+
+    stages {
+
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Source Code') {
+            steps {
+                checkout scmGit(
+                    branches: [[name: '*/main']],
+                    userRemoteConfigs: [[
+                        credentialsId: 'git-cred',
+                        url: 'https://github.com/sridattaga/Book-My-Show.git'
+                    ]]
+                )
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar-scanner') {
+                    sh '''
+                    $SCANNER_HOME/bin/sonar-scanner \
+                    -Dsonar.projectName=BMS \
+                    -Dsonar.projectKey=BMS
+                    '''
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                waitForQualityGate abortPipeline: true, credentialsId: 'Sonar-token'
+            }
+        }
+
+        stage('Install App Dependencies') {
+            steps {
+                sh '''
+                cd bookmyshow-app
+                npm install
+                '''
+            }
+        }
+
+        stage('Trivy File System Scan') {
+            steps {
+                sh '''
+                trivy fs . > trivyfs.txt
+                '''
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh '''
+                docker build --no-cache \
+                -t $DOCKER_IMAGE \
+                -f bookmyshow-app/Dockerfile \
+                bookmyshow-app
+                '''
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                withDockerRegistry(credentialsId: 'docker-cred', url: '') {
+                    sh '''
+                    docker push $DOCKER_IMAGE
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Init & Apply') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                    export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+                    export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+                    export AWS_DEFAULT_REGION=$AWS_REGION
+
+                    cd terraform
+                    terraform init
+                    terraform apply -auto-approve
+                    '''
+                }
+            }
+        }
+
+        stage('Configure kubectl for EKS') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    sh '''
+                    export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+                    export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+                    export AWS_DEFAULT_REGION=$AWS_REGION
+
+                    aws eks update-kubeconfig \
+                      --region $AWS_REGION \
+                      --name $EKS_CLUSTER
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes (EKS)') {
+            steps {
+                sh '''
+                kubectl apply -f deployment.yaml
+                kubectl apply -f service.yaml
+
+                kubectl get pods
+                kubectl get svc
+                '''
+            }
+        }
+    }
+
+    post {
+
+        success {
+            emailext(
+                attachLog: true,
+                subject: "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                <h2>Build & Deployment Successful</h2>
+                <p><b>Job:</b> ${env.JOB_NAME}</p>
+                <p><b>Build:</b> ${env.BUILD_NUMBER}</p>
+                <p><b>Status:</b> SUCCESS</p>
+                <p><b>URL:</b> ${env.BUILD_URL}</p>
+                """,
+                to: 'sridatta1971@gmail.com',
+                attachmentsPattern: 'trivyfs.txt'
+            )
+        }
+
+        failure {
+            emailext(
+                attachLog: true,
+                subject: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                <h2>Build Failed</h2>
+                <p><b>Job:</b> ${env.JOB_NAME}</p>
+                <p><b>Build:</b> ${env.BUILD_NUMBER}</p>
+                <p><b>Status:</b> FAILED</p>
+                <p><b>URL:</b> ${env.BUILD_URL}</p>
+                """,
+                to: 'sridatta1971@gmail.com',
+                attachmentsPattern: 'trivyfs.txt'
+            )
+        }
+
+        cleanup {
+            cleanWs()
+        }
+    }
+}
