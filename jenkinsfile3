@@ -1,0 +1,222 @@
+pipeline {
+    agent any
+
+    tools {
+        jdk 'jdk17'
+        nodejs 'node20'
+    }
+
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        DOCKER_IMAGE = 'sridatta5157/bookmyshowproj:latest'
+    }
+
+    stages {
+
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout from Git') {
+            steps {
+
+                checkout scmGit(
+                    branches: [[name: '*/main']],
+                    extensions: [],
+                    userRemoteConfigs: [[
+                        credentialsId: 'git-cred',
+                        url: 'https://github.com/sridattaga/Book-My-Show.git'
+                    ]]
+                )
+
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+
+                withSonarQubeEnv('sonar-scanner') {
+
+                    sh '''
+                    echo "Starting SonarQube Analysis..."
+
+                    $SCANNER_HOME/bin/sonar-scanner \
+                    -Dsonar.projectName=BMS \
+                    -Dsonar.projectKey=BMS
+                    '''
+
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+
+                script {
+
+                    waitForQualityGate abortPipeline: false,
+                    credentialsId: 'Sonar-token'
+
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+
+                sh '''
+                cd bookmyshow-app
+
+                echo "Checking application files..."
+                ls -la
+
+                if [ -f package.json ]; then
+
+                    echo "Removing old dependencies..."
+                    rm -rf node_modules package-lock.json
+
+                    echo "Installing npm packages..."
+                    npm install
+
+                else
+
+                    echo "ERROR: package.json not found!"
+                    exit 1
+
+                fi
+                '''
+
+            }
+        }
+
+        stage('Trivy FS Scan') {
+            steps {
+
+                sh '''
+                echo "Running Trivy File System Scan..."
+
+                trivy fs . > trivyfs.txt
+                '''
+
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+
+                sh '''
+                echo "Building Docker Image..."
+
+                docker build --no-cache \
+                -t $DOCKER_IMAGE \
+                -f bookmyshow-app/Dockerfile \
+                bookmyshow-app
+                '''
+
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+
+                script {
+
+                    withDockerRegistry(
+                        credentialsId: 'docker-cred',
+                        url: ''
+                    ) {
+
+                        sh '''
+                        echo "Pushing Docker Image to DockerHub..."
+
+                        docker push $DOCKER_IMAGE
+                        '''
+
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Container') {
+            steps {
+
+                sh '''
+                echo "Stopping existing container..."
+
+                docker stop bms || true
+                docker rm bms || true
+
+                echo "Removing unused Docker images..."
+                docker image prune -f
+
+                echo "Starting new container..."
+
+                docker run -d \
+                --restart=always \
+                --name bms \
+                -p 3000:3000 \
+                $DOCKER_IMAGE
+
+                echo "Checking running containers..."
+                docker ps -a
+
+                echo "Waiting for application startup..."
+                sleep 15
+
+                echo "Fetching container logs..."
+                docker logs bms
+                '''
+
+            }
+        }
+    }
+
+    post {
+
+        success {
+
+            emailext(
+                attachLog: true,
+                subject: "SUCCESS: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                body: """
+                <h2>Build Successful</h2>
+
+                <p><b>Project:</b> ${env.JOB_NAME}</p>
+                <p><b>Build Number:</b> ${env.BUILD_NUMBER}</p>
+                <p><b>Status:</b> SUCCESS</p>
+                <p><b>Build URL:</b> ${env.BUILD_URL}</p>
+                """,
+                to: 'sridatta1971@gmail.com',
+                attachmentsPattern: 'trivyfs.txt'
+            )
+
+        }
+
+        failure {
+
+            emailext(
+                attachLog: true,
+                subject: "FAILED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                body: """
+                <h2>Build Failed</h2>
+
+                <p><b>Project:</b> ${env.JOB_NAME}</p>
+                <p><b>Build Number:</b> ${env.BUILD_NUMBER}</p>
+                <p><b>Status:</b> FAILED</p>
+                <p><b>Build URL:</b> ${env.BUILD_URL}</p>
+                """,
+                to: 'sridatta1971@gmail.com',
+                attachmentsPattern: 'trivyfs.txt'
+            )
+
+        }
+
+        always {
+
+            cleanWs()
+
+        }
+    }
+}
